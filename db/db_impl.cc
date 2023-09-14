@@ -1455,6 +1455,40 @@ bool DBImpl::GetProperty(const Slice& property, std::string* value) {
                   static_cast<unsigned long long>(total_usage));
     value->append(buf);
     return true;
+  } else if (in.starts_with("compact-rate-at-level")) {
+    in.remove_prefix(strlen("compact-rate-at-level"));
+    uint64_t level;
+    bool ok = ConsumeDecimalNumber(&in, &level) && in.empty();
+    if (!ok || level >= config::kNumLevels) {
+      return false;
+    } else {
+      char buf[100];
+      double bytes = stats_[level].bytes_read + stats_[level].bytes_written;
+      if (bytes == 0 || stats_[level].micros == 0) {
+        std::snprintf(buf, sizeof(buf), "nothing happened.");
+      } else {
+        std::snprintf(buf, sizeof(buf), "%.2fMB/s", bytes / (stats_[level].micros * 1.048576));
+      }
+
+      printf("read = %ld, write = %ld, cost = %ld\n", stats_[level].bytes_read, stats_[level].bytes_written, stats_[level].micros);
+      
+      *value = buf;
+      return true;
+    }
+  } else if (in.starts_with("compact-bytes-at-level")) {
+      in.remove_prefix(strlen("compact-bytes-at-level"));
+      uint64_t level;
+      bool ok = ConsumeDecimalNumber(&in, &level) && in.empty();
+      if (!ok || level >= config::kNumLevels) {
+        return false;
+      } else {
+        char buf[100];
+        int64_t bytes = stats_[level].bytes_read + stats_[level].bytes_written;
+        std::snprintf(buf, sizeof(buf), "%lld", bytes);
+        
+        *value = buf;
+        return true;
+    }
   }
 
   return false;

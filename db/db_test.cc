@@ -39,6 +39,11 @@ static std::string RandomKey(Random* rnd) {
   return test::RandomKey(rnd, len);
 }
 
+void CleanSysBuffer() {
+  system("sync");
+  system("echo 3 > /proc/sys/vm/drop_caches");
+}
+
 namespace {
 class AtomicCounter {
  public:
@@ -268,14 +273,14 @@ class DBTest : public testing::Test {
   DBTest() : env_(new SpecialEnv(Env::Default())), option_config_(kDefault) {
     filter_policy_ = NewBloomFilterPolicy(10);
     dbname_ = testing::TempDir() + "db_test";
-    DestroyDB(dbname_, Options());
+    // DestroyDB(dbname_, Options());
     db_ = nullptr;
     Reopen();
   }
 
   ~DBTest() {
     delete db_;
-    DestroyDB(dbname_, Options());
+    // DestroyDB(dbname_, Options());
     delete env_;
     delete filter_policy_;
   }
@@ -515,6 +520,18 @@ class DBTest : public testing::Test {
   std::string DumpSSTableList() {
     std::string property;
     db_->GetProperty("leveldb.sstables", &property);
+    return property;
+  }
+
+  std::string CompactRateAtLevel(int level) {
+    std::string property;
+    db_->GetProperty("leveldb.compact-rate-at-level" + NumberToString(level), &property);
+    return property;
+  }
+
+  std::string CompactBytesAtLevel(int level) {
+    std::string property;
+    db_->GetProperty("leveldb.compact-bytes-at-level" + NumberToString(level), &property);
     return property;
   }
 
@@ -763,6 +780,198 @@ TEST_F(DBTest, GetPicksCorrectFile) {
     ASSERT_EQ("vf", Get("f"));
     ASSERT_EQ("vx", Get("x"));
   } while (ChangeOptions());
+}
+
+TEST_F(DBTest, FlushRate) {
+  uint64_t start, end, bytes;
+  Options options = CurrentOptions();
+  options.write_buffer_size = 2 * 1024 * 1024;
+  options.compression = kNoCompression;
+  Reopen(&options);
+
+  MakeTables(2, "A", "Z");
+  ASSERT_EQ(NumTableFilesAtLevel(2), 1);
+  ASSERT_EQ(NumTableFilesAtLevel(1), 1);
+  ASSERT_EQ(NumTableFilesAtLevel(0), 0);
+  CleanSysBuffer();
+  start = env_->NowMicros();
+
+  const int vsize = 1024;
+  const int entries = options.write_buffer_size / (vsize + 256);
+  const std::string value(vsize, 'x');
+  for (int k = 0 ; k < config::kL0_CompactionTrigger - 1 ; k ++) {
+    // Write approximately write_buffer_size of "C" values, and create a sst table at level-0.
+    for (int i = 0; i < entries; i++) {
+      char key[100];
+      std::snprintf(key, sizeof(key), "C%09d", i + k * entries);
+      Put(key, value);
+    }
+
+    dbfull()->TEST_CompactMemTable();
+  }
+  end = env_->NowMicros();
+  
+  Slice in(CompactBytesAtLevel(0));
+  bool ok = ConsumeDecimalNumber(&in, &bytes);
+  ASSERT_EQ(ok, true);
+
+  printf("%s\n", DumpSSTableList().c_str());
+  ASSERT_EQ(NumTableFilesAtLevel(0), config::kL0_CompactionTrigger - 1);
+  printf("Flush rate: %s(only flush)\n", CompactRateAtLevel(0).c_str());
+  printf("%.2lfMB/s, bytes = %llu, cost = %llu\n", bytes / ((end - start) * 1.048576), bytes, end - start);
+}
+
+TEST_F(DBTest, PrepSST) {
+  uint64_t start, end, bytes;
+  Options options = CurrentOptions();
+  options.write_buffer_size = 2 * 1024 * 1024;
+  options.compression = kSnappyCompression;
+  Reopen(&options);
+
+  // make sure that new sst table will create at level-0
+  ASSERT_LEVELDB_OK(Put("A", "xxxx"));
+  ASSERT_LEVELDB_OK(Put("Z", "xxxx"));
+  dbfull()->TEST_CompactMemTable();
+  ASSERT_LEVELDB_OK(Delete("A"));
+  ASSERT_LEVELDB_OK(Delete("Z"));
+  dbfull()->TEST_CompactMemTable();
+
+  ASSERT_EQ(NumTableFilesAtLevel(2), 1);
+  ASSERT_EQ(NumTableFilesAtLevel(1), 1);
+  ASSERT_EQ(NumTableFilesAtLevel(0), 0);
+
+  const int vsize = 1024;
+  const int entries = options.write_buffer_size / (vsize + 256);
+  const std::string value(vsize, 'x');
+
+  ASSERT_EQ((config::kL0_CompactionTrigger) % 2, 0);
+
+  start = env_->NowMicros();
+  int b = 0;
+  for (int k = 0 ; k < config::kL0_CompactionTrigger - 2; k ++) {
+    printf("%d : %d  ", k, b);
+    for (int i = 0; i < entries; i++) {
+      char key[100];
+      std::snprintf(key, sizeof(key), "C%09d", i + b);
+      Put(key, value);
+    }
+
+    b += (k % 2) ? entries : (entries >> 1);
+    printf("%d : %d\n", k, b - 1);
+    dbfull()->TEST_CompactMemTable();
+  }
+  end = env_->NowMicros();
+
+  Slice in(CompactBytesAtLevel(0));
+  bool ok = ConsumeDecimalNumber(&in, &bytes);
+  ASSERT_EQ(ok, true);
+
+  // clear level-1 and level-2
+  dbfull()->TEST_CompactRange(1, nullptr, nullptr);
+  dbfull()->TEST_CompactRange(2, nullptr, nullptr);
+  ASSERT_EQ(NumTableFilesAtLevel(0), config::kL0_CompactionTrigger - 2);
+  printf("%s\n", DumpSSTableList().c_str());
+  printf("%.2lfMB/s, bytes = %llu, cost = %llu\n", bytes / ((end - start) * 1.048576), bytes, end - start);
+}
+
+TEST_F(DBTest, CompactLevle0) {
+  uint64_t start, end, bytes;
+  Options options = CurrentOptions();
+  options.write_buffer_size = 2 * 1024 * 1024;
+  options.compression = kSnappyCompression;
+  Reopen(&options);
+  CleanSysBuffer();
+  ASSERT_EQ(NumTableFilesAtLevel(2), 0);
+  ASSERT_EQ(NumTableFilesAtLevel(1), 0);
+  ASSERT_EQ(NumTableFilesAtLevel(0), config::kL0_CompactionTrigger - 2);
+  printf("%s\n", DumpSSTableList().c_str());
+  
+  const int vsize = 1024;
+  const int entries = options.write_buffer_size / (vsize + 256);
+
+  char beginS[100], endS[100];
+  int b = 0;
+  start = env_->NowMicros();
+  for (int k = 0 ; k < config::kL0_CompactionTrigger - 2; k ++) {
+    if (k % 2) {
+      b += (entries >> 1) * 3;
+      std::snprintf(endS, sizeof(endS), "C%09d", b - 1);
+      printf("%d : %s\n", k, endS);
+
+      Slice begin(beginS), end(endS);
+      printf("%s %s\n", begin.ToString().c_str(), end.ToString().c_str());
+      dbfull()->TEST_CompactRange(0, &begin, &end);
+    } else {
+      std::snprintf(beginS, sizeof(beginS), "C%09d", b);
+      printf("%d : %s\n", k, beginS);
+    }
+  }
+  end = env_->NowMicros();
+
+  Slice in(CompactBytesAtLevel(0));
+  bool ok = ConsumeDecimalNumber(&in, &bytes);
+  ASSERT_EQ(ok, true);
+
+  printf("%s\n", DumpSSTableList().c_str());
+  ASSERT_EQ(NumTableFilesAtLevel(0), 0);
+  
+  printf("level-0 = %s, level-1 = %s, level-2 = %s, level-3 = %s, level-4 = %s\n", CompactBytesAtLevel(0).c_str(), CompactBytesAtLevel(1).c_str(),
+                                                                                  CompactBytesAtLevel(2).c_str(), CompactBytesAtLevel(3).c_str(),
+                                                                                  CompactBytesAtLevel(4).c_str());
+  printf("Compact sst table rate: %s\n", CompactRateAtLevel(1).c_str());
+  printf("%.2lfMB/s, bytes = %llu, cost = %llu\n", bytes / ((end - start) * 1.048576), bytes, end - start);
+}
+
+TEST_F(DBTest, CompactRate) {
+  Options options = CurrentOptions();
+  options.write_buffer_size = 2 * 1024 * 1024;
+  options.compression = kSnappyCompression;
+  Reopen(&options);
+
+  // make sure that new sst table will create at level-0
+  ASSERT_LEVELDB_OK(Put("A", "xxxx"));
+  ASSERT_LEVELDB_OK(Put("Z", "xxxx"));
+  dbfull()->TEST_CompactMemTable();
+  ASSERT_LEVELDB_OK(Delete("A"));
+  ASSERT_LEVELDB_OK(Delete("Z"));
+  dbfull()->TEST_CompactMemTable();
+
+  ASSERT_EQ(NumTableFilesAtLevel(2), 1);
+  ASSERT_EQ(NumTableFilesAtLevel(1), 1);
+  ASSERT_EQ(NumTableFilesAtLevel(0), 0);
+
+  const int vsize = 1024;
+  const int entries = options.write_buffer_size / (vsize + 256);
+  const std::string value(vsize, 'x');
+  for (int k = 0 ; k < config::kL0_CompactionTrigger - 1; k ++) {
+    for (int i = 0; i < entries; i++) {
+      char key[100];
+      std::snprintf(key, sizeof(key), "C%09d", i + k * (entries >> 1));
+      Put(key, value);
+    }
+    dbfull()->TEST_CompactMemTable();
+  }
+
+  // clear level-1 and level-2
+  dbfull()->TEST_CompactRange(1, nullptr, nullptr);
+  dbfull()->TEST_CompactRange(2, nullptr, nullptr);
+  
+  // clear stats
+  Reopen(&options);
+  CleanSysBuffer();
+  ASSERT_EQ(NumTableFilesAtLevel(2), 0);
+  ASSERT_EQ(NumTableFilesAtLevel(1), 0);
+  ASSERT_EQ(NumTableFilesAtLevel(0), config::kL0_CompactionTrigger - 1);
+  printf("%s\n", DumpSSTableList().c_str());
+  dbfull()->TEST_CompactRange(0, nullptr, nullptr);
+
+  ASSERT_EQ(NumTableFilesAtLevel(0), 0);
+  
+  printf("%s\n", DumpSSTableList().c_str());
+  printf("level-0 = %s, level-1 = %s, level-2 = %s, level-3 = %s, level-4 = %s\n", CompactBytesAtLevel(0).c_str(), CompactBytesAtLevel(1).c_str(),
+                                                                                  CompactBytesAtLevel(2).c_str(), CompactBytesAtLevel(3).c_str(),
+                                                                                  CompactBytesAtLevel(4).c_str());
+  printf("Compact sst table rate: %s\n", CompactRateAtLevel(1).c_str());
 }
 
 TEST_F(DBTest, GetEncountersEmptyLevel) {
